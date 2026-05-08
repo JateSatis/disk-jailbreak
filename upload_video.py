@@ -11,14 +11,15 @@ Options:
     --duration N     Trim video to N seconds (default: no limit).
     --resolution NxM Output resolution (default: 480x480). E.g. 320x320.
     --no-audio       Drop audio track (saves ~2% space).
+    --audio-rate N   Audio sample rate Hz (default: 16000). 8000 = phone quality but ~half size.
 
-Device storage limit: ~8 MB blob. Original app enforces 5-second limit which stays ~3-4 MB.
-To fit a 10-15s clip: try --quality 18 --fps 15, or --duration 8.
+Device storage limit: ~1.74 MB blob. Fits ~14s at 480x480/q10 or ~20s at 240x240/q25.
+Audio alone at 16kHz consumes 32KB/s. Use --audio-rate 8000 to halve audio overhead.
 
 Example:
     python upload_video.py "BW01" my_video.mp4
-    python upload_video.py "BW01" my_video.mp4 --duration 8
-    python upload_video.py "BW01" my_video.mp4 --quality 18 --fps 15
+    python upload_video.py "BW01" my_video.mp4 --duration 14
+    python upload_video.py "BW01" my_video.mp4 --audio-rate 8000 --resolution 240x240 --fps 20
     python upload_video.py "9D:05:2E:7F:A2:05" my_video.mp4
 
 Requirements:
@@ -118,7 +119,7 @@ def build_wt_packet(cmd: int, payload: bytes) -> bytes:
             payload)
 
 
-def build_wt_start_payload(avi_data: bytes) -> bytes:
+def build_wt_start_payload(avi_data: bytes, declared_blob_size: int = None) -> bytes:
     """
     Build the START command payload (c42.g in the app → lt2.Q method).
 
@@ -131,17 +132,19 @@ def build_wt_start_payload(avi_data: bytes) -> bytes:
       - RGB = (0, 0, 0)  (no background color override)
       - blobSize = 4 + len(avi_data)  (the blob prepends a 4-byte size header)
       - style bytes all zero (no style list passed)
+
+    declared_blob_size: if set, overrides the blobSize field sent to the device.
+      The device checks this value against its firmware limit at START time.
+      Actual data sent in chunks and FINISH checksum always use the real blob size.
     """
-    blob_size = 4 + len(avi_data)
-    # Feature bitmask: array [isShowBgColor, hasPreview, hasScale, hasBg, hasWatchTheme, hasDefaultBg]
-    # For video-only: only hasBg (index 3) = 1
-    # he1.a() reads as binary string MSB=arr[5]...LSB=arr[0], so bit3=arr[3]=1 → 0b001000 = 8
+    actual_blob_size = 4 + len(avi_data)
+    blob_size = declared_blob_size if declared_blob_size is not None else actual_blob_size
     feature_bits = 0b001000  # = 8
 
     return (struct.pack(">I", WT_WATCH_ID) +          # watchID (4B BE)
             bytes([WT_FILE_TYPE, feature_bits]) +       # fileType, featureBits
             bytes([0, 0, 0]) +                          # R, G, B (no bg color)
-            struct.pack(">I", blob_size) +              # blobSize (4B BE)
+            struct.pack(">I", blob_size) +              # blobSize (4B BE) — may be overridden
             bytes([0, 0, 0, 0]))                        # style bytes (all zero)
 
 
@@ -160,12 +163,17 @@ def build_wt_chunk(index_1based: int, chunk_data: bytes) -> bytes:
     return indexed + struct.pack(">I", checksum)
 
 
-def build_wt_finish_payload(blob: bytes) -> bytes:
+def build_wt_finish_payload(blob: bytes, declared_size: int = None) -> bytes:
     """
     Build the FINISH command payload (confirmed from lt2.k() smali).
-    Returns 4-byte BE sum of ALL bytes in the blob (size-header + avi-bytes).
+    Returns 4-byte BE sum of blob bytes.
+
+    When declared_size is set (fake-size upload), the device verifies checksum
+    over only the first declared_size bytes (matching the blobSize it was told
+    at START), not the full blob. We must match its expectation.
     """
-    total_sum = sum(b & 0xFF for b in blob) & 0xFFFFFFFF
+    checksum_data = blob[:declared_size] if declared_size is not None else blob
+    total_sum = sum(b & 0xFF for b in checksum_data) & 0xFFFFFFFF
     return struct.pack(">I", total_sum)
 
 
@@ -243,10 +251,28 @@ def find_ffmpeg():
     return None
 
 
+def patch_avi_riff_size(blob: bytes, declared_size: int) -> bytes:
+    """
+    Patch the RIFF chunk-size field in a fake-size blob so the AVI player
+    knows the file ends at declared_size bytes and doesn't read past EOF.
+
+    blob layout: [4B BE avi_size_header][AVI file bytes...]
+    AVI file starts at blob[4]. RIFF chunk size at blob[8:12] (LE) should be
+    (avi_file_bytes_count - 8) = (declared_size - 4 - 8) = declared_size - 12.
+    """
+    if len(blob) >= 16 and blob[4:8] == b"RIFF":
+        blob = bytearray(blob)
+        riff_chunk_size = max(0, declared_size - 12)
+        blob[8:12] = struct.pack("<I", riff_chunk_size)
+        return bytes(blob)
+    return blob
+
+
 def prepare_video(input_path: Path, output_path: Path,
                   width: int = 480, height: int = 480,
                   fps: int = 24, quality: int = 10,
                   duration: float = None, no_audio: bool = False,
+                  audio_rate: int = 16000,
                   ffmpeg: str = "ffmpeg") -> bool:
     """
     Preprocess video for the device.
@@ -279,7 +305,7 @@ def prepare_video(input_path: Path, output_path: Path,
     if no_audio:
         cmd += ["-an"]
     else:
-        cmd += ["-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1"]
+        cmd += ["-c:a", "pcm_s16le", "-ar", str(audio_rate), "-ac", "1"]
     cmd += ["-f", "avi", str(output_path)]
 
     print(f"FFmpeg: {' '.join(cmd)}")
@@ -314,11 +340,12 @@ def build_device_info_payload() -> bytes:
 class VideoUploader:
     def __init__(self, client: BleakClient,
                  write_uuid: str = WRITE_UUID, notify_uuid: str = NOTIFY_UUID,
-                 verbose: bool = True):
+                 verbose: bool = True, start_size_override: int = None):
         self.client       = client
         self._write_uuid  = write_uuid
         self._notify_uuid = notify_uuid
         self.verbose      = verbose
+        self._start_size_override = start_size_override  # fake blobSize in START packet
         self._queue: asyncio.Queue = asyncio.Queue()
         self._raw_queue: asyncio.Queue = asyncio.Queue()  # raw bytes for debugging
         self._buffer = bytearray()
@@ -432,7 +459,22 @@ class VideoUploader:
         # Build blob: [4-byte BE AVI size][AVI bytes]
         # Confirmed from lt2.S() smali: p4 = size headers block, this.o = file data,
         # then this.o = concat(p4, file_data). For video-only: blob = [4B AVI_len][AVI]
-        blob = struct.pack(">I", avi_len) + avi_data
+        #
+        # When start_size_override is set we also fake blob[0:4].
+        # The device validates blob[0:4] == declared_blobSize - 4 on the first DATA chunk.
+        # If there is a mismatch it responds with responseCode=0 (validation error).
+        if self._start_size_override is not None:
+            fake_header = self._start_size_override - 4
+            blob = struct.pack(">I", fake_header) + avi_data
+            self.log(f"     [!] Faking blob[0:4] = {fake_header:,} "
+                     f"to match declared blobSize (actual AVI = {avi_len:,})")
+            # Patch AVI RIFF header so the AVI player knows the file ends at
+            # declared_size bytes and doesn't try to read beyond the buffer.
+            blob = patch_avi_riff_size(blob, self._start_size_override)
+            self.log(f"     [!] Patched AVI RIFF chunk-size to {self._start_size_override - 12:,} "
+                     f"(tells player file ends at byte {self._start_size_override - 4:,})")
+        else:
+            blob = struct.pack(">I", avi_len) + avi_data
         blob_len = len(blob)
 
         self.log(f"\nFile: {video_path.name}  ({avi_len:,} bytes AVI)")
@@ -462,20 +504,42 @@ class VideoUploader:
         # ── Step 1: Send WatchTheme START ─────────────────────────────────────
         # This is what triggers the animation on the device immediately.
         # (c42.g → cmd=0x02, before ANY data is sent)
-        self.log("\n[1] Sending WatchTheme START (0x1f cmd=0x02)...")
-        start_payload = build_wt_start_payload(avi_data)
-        self.log(f"     START payload ({len(start_payload)}B): {start_payload.hex()}")
-        await self._send_wt(WT_CMD_START, start_payload)
+        # Retry up to 5 times if device returns error code 4 (errorCode 1009 = "device busy"
+        # / "upgrade in progress" — seen in charging/recovery mode). A delay often resolves it.
+        start_payload = build_wt_start_payload(avi_data, self._start_size_override)
+        start_chunk = None
+        for start_attempt in range(5):
+            if start_attempt > 0:
+                self.log(f"\n[1] Retrying WatchTheme START (attempt {start_attempt+1}/5, "
+                         f"waiting 8s for device to settle)...")
+                await asyncio.sleep(8.0)
+            else:
+                self.log("\n[1] Sending WatchTheme START (0x1f cmd=0x02)...")
+            if self._start_size_override is not None:
+                self.log(f"     [!] Declaring fake blobSize = {self._start_size_override:,} "
+                         f"(actual = {blob_len:,}) to bypass firmware size check")
+            self.log(f"     START payload ({len(start_payload)}B): {start_payload.hex()}")
+            await self._send_wt(WT_CMD_START, start_payload)
 
-        # ── Step 2: Wait for device "ready" response ──────────────────────────
-        # Device responds with responseCode=1000 → normalized=0 → ready, start from chunk 1.
-        # From lt2.N() smali: if sendNum==0 and normalized==0 → Y() (start sending).
-        self.log("\n[2] Waiting for device START acknowledgement...")
-        resp = await self._wait_wt_response(timeout=15.0, context="START ack")
-        if resp is None:
-            self.log("ERROR: device did not acknowledge START (timeout).")
+            # ── Step 2: Wait for device "ready" response ──────────────────────────
+            self.log("\n[2] Waiting for device START acknowledgement...")
+            resp = await self._wait_wt_response(timeout=15.0, context="START ack")
+            if resp is None:
+                self.log("  (timeout on START ack)")
+                continue
+            kind, val = resp
+            if kind == "error" and val == 4:
+                self.log(f"  Device returned code 4 (errorCode 1009 — busy/locked). Will retry.")
+                continue
+            # Got a real response — break out of retry loop
+            start_chunk = (kind, val)
+            break
+
+        if start_chunk is None:
+            self.log("ERROR: device did not acknowledge START after retries.")
             return False
-        kind, val = resp
+
+        kind, val = start_chunk
         if kind == "rejected":
             limit_mb = val / 1024 / 1024
             blob_mb  = blob_len / 1024 / 1024
@@ -496,6 +560,7 @@ class VideoUploader:
             return True
         # kind == "progress", val = normalized chunk number (0 = start from beginning)
         start_chunk = val  # normalized=0 → start from chunk 1 (index 0)
+        # (start_chunk shadows the outer loop variable — intended)
         self.log(f"     Device ready. Normalized={val}. Starting from chunk {start_chunk+1}.")
 
         # ── Step 3: Send data chunks (stop-and-wait) ──────────────────────────
@@ -504,8 +569,14 @@ class VideoUploader:
         #   Device ACKs with responseCode = 1000 + N (normalized = N).
         #   Phone then sends chunk N+1. Repeat until all chunks sent.
         #   After last chunk, phone sends FINISH.
-        self.log(f"\n[3] Sending {blob_len:,} bytes in {WT_CHUNK_SIZE}-byte chunks...")
-        total_chunks = (blob_len + WT_CHUNK_SIZE - 1) // WT_CHUNK_SIZE
+        # When fake-size is active, only send up to declared_size bytes.
+        # Sending MORE than declared causes a buffer overflow in firmware → crash loop.
+        send_limit = self._start_size_override if self._start_size_override is not None else blob_len
+        if send_limit > blob_len:
+            send_limit = blob_len
+        self.log(f"\n[3] Sending {send_limit:,} bytes in {WT_CHUNK_SIZE}-byte chunks "
+                 f"({'declared limit' if self._start_size_override else 'full blob'})...")
+        total_chunks = (send_limit + WT_CHUNK_SIZE - 1) // WT_CHUNK_SIZE
         t0 = time.monotonic()
 
         chunk_idx = start_chunk  # 0-based, will send chunk (chunk_idx+1)
@@ -513,7 +584,7 @@ class VideoUploader:
         while chunk_idx < total_chunks:
             chunk_no    = chunk_idx + 1  # 1-based index sent in packet
             chunk_start = chunk_idx * WT_CHUNK_SIZE
-            chunk_end   = min(chunk_start + WT_CHUNK_SIZE, blob_len)
+            chunk_end   = min(chunk_start + WT_CHUNK_SIZE, send_limit)
             chunk_data  = blob[chunk_start:chunk_end]
 
             pkt_payload = build_wt_chunk(chunk_no, chunk_data)
@@ -556,8 +627,11 @@ class VideoUploader:
         # ── Step 4: Send FINISH ───────────────────────────────────────────────
         # Payload = 4-byte BE sum of ALL blob bytes (confirmed from lt2.k() smali)
         self.log("\n[4] Sending WatchTheme FINISH (0x1f cmd=0x03)...")
-        finish_payload = build_wt_finish_payload(blob)
-        self.log(f"     blob checksum = {struct.unpack('>I', finish_payload)[0]:#010x}")
+        finish_payload = build_wt_finish_payload(blob, self._start_size_override)
+        checksum_range = (f"first {self._start_size_override:,} bytes"
+                         if self._start_size_override else "full blob")
+        self.log(f"     blob checksum = {struct.unpack('>I', finish_payload)[0]:#010x}"
+                 f"  (over {checksum_range})")
         await self._send_wt(WT_CMD_FINISH, finish_payload)
 
         # ── Step 5: Wait for success ──────────────────────────────────────────
@@ -636,11 +710,17 @@ class VideoUploader:
                 self.log(f"     [WARN] unexpected WatchTheme code {code}")
                 return ("error", code)
 
-            # 0x25 keep-alives — ignore
+            # 0x25 packets — respond to DEVICE_INFO_REQUEST instead of ignoring.
+            # Device may send multiple rounds of DEVICE_INFO_REQUEST (e.g. in charging mode)
+            # and reject WatchTheme uploads if we don't respond to each one.
             parsed = parse_25_packet(raw)
             if parsed:
                 mod, cmd, payload = parsed
-                self.log(f"  (0x25 keep-alive: mod={mod:#04x} cmd={cmd:#04x})")
+                self.log(f"  (0x25 packet: mod={mod:#04x} cmd={cmd:#04x} payload={payload.hex()})")
+                if mod == MOD_SYSTEM_INFO and cmd == CMD_DEVICE_INFO_REQUEST:
+                    self.log(f"    → Responding to DEVICE_INFO_REQUEST mid-transfer...")
+                    await self._send_25(MOD_SYSTEM_INFO, CMD_DEVICE_INFO_RESPONSE,
+                                        build_device_info_payload())
                 continue
 
             self.log(f"  [WARN] unrecognized packet: {raw.hex()}")
@@ -654,10 +734,10 @@ async def find_device(name_or_addr: str):
     print(f"Scanning for device: {name_or_addr!r} ...")
     is_addr = len(name_or_addr) == 17 and name_or_addr.count(":") == 5
     if is_addr:
-        return await BleakScanner.find_device_by_address(name_or_addr, timeout=15.0)
+        return await BleakScanner.find_device_by_address(name_or_addr, timeout=30.0)
     return await BleakScanner.find_device_by_filter(
         lambda d, _: name_or_addr.lower() in (d.name or "").lower(),
-        timeout=15.0,
+        timeout=30.0,
     )
 
 
@@ -678,6 +758,12 @@ async def main():
     parser.add_argument("--duration",   type=float, default=None,help="Trim to N seconds")
     parser.add_argument("--resolution", type=str,   default="480x480", help="Output WxH (default: 480x480)")
     parser.add_argument("--no-audio",   action="store_true",     help="Drop audio track")
+    parser.add_argument("--audio-rate", type=int,   default=16000,
+                        help="Audio sample rate Hz (default: 16000). 8000 = phone quality, half size.")
+    parser.add_argument("--start-size", type=int, default=None,
+                        help="Override blobSize declared in START packet (bytes). "
+                             "Use to bypass firmware size check: declare small value, "
+                             "send actual larger blob. Try: --start-size 1000000")
 
     args = parser.parse_args()
     name_or_addr = args.device
@@ -702,7 +788,7 @@ async def main():
     print(f"FFmpeg: {ffmpeg_path}")
     tmp_dir  = Path(tempfile.gettempdir())
     # Include quality/fps/duration in filename so re-runs don't reuse wrong cache
-    suffix = f"_q{args.quality}_fps{args.fps}"
+    suffix = f"_q{args.quality}_fps{args.fps}_ar{args.audio_rate}"
     if args.duration:
         suffix += f"_t{args.duration}"
     prepared = tmp_dir / f"badge_upload_{video_file.stem}{suffix}.avi"
@@ -723,6 +809,7 @@ async def main():
                              width=res_w, height=res_h,
                              fps=args.fps, quality=args.quality,
                              duration=args.duration, no_audio=args.no_audio,
+                             audio_rate=args.audio_rate,
                              ffmpeg=ffmpeg_path):
             print("ERROR: FFmpeg failed.")
             sys.exit(1)
@@ -756,7 +843,8 @@ async def main():
                 print(f"    Char:  {ch.uuid}  [{','.join(ch.properties)}]")
         print("--------------------------------------\n")
 
-        uploader = VideoUploader(client, write_uuid=WRITE_UUID, notify_uuid=NOTIFY_UUID)
+        uploader = VideoUploader(client, write_uuid=WRITE_UUID, notify_uuid=NOTIFY_UUID,
+                                 start_size_override=args.start_size)
         uploader._mtu_payload = max(20, mtu - 3)
         success = await uploader.upload(prepared)
 
