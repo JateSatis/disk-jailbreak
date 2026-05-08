@@ -88,6 +88,11 @@ WT_CHUNK_SIZE = 5000
 # Inter-write delay matching CommandPool.n(6) = 6ms
 BLE_WRITE_INTERVAL = 0.006
 
+# Device storage slot limit for watchID 5538 — confirmed via response-code analysis:
+# two independent attempts (blob=4.9MB → overage=2.70MB; blob=2.31MB → overage=70KB)
+# both yield  limit = blob - overage = 2,236,416 bytes exactly.
+DEVICE_SLOT_LIMIT = 2_236_416
+
 
 # ── 0x25 packet builder (for handshake only) ─────────────────────────────────
 
@@ -230,7 +235,7 @@ def parse_wt_response(data: bytes):
 #   str(code)[1] == '1'  → type-1: device silently waits (observed: file too large)
 #   value = int(str(code)[2:]) — embedded value (suspected: device storage limit in bytes)
 WT_RESP_M_RANGE_LO = 100_000_000
-WT_RESP_M_RANGE_HI = 200_000_000
+WT_RESP_M_RANGE_HI = 1_000_000_000  # upper bound: codes are 10XXXXXXXX, 20XXXXXXXX, etc.
 
 
 # ── Video preprocessing ───────────────────────────────────────────────────────
@@ -277,7 +282,7 @@ def prepare_video(input_path: Path, output_path: Path,
     """
     Preprocess video for the device.
     Device requires AVI/MJPEG (confirmed from VideoCutActivity.smali FFmpeg command).
-    Audio: PCM 16-bit LE, 16 kHz, mono.
+    Audio: PCM 16-bit LE, mono.
 
     quality: MJPEG q:v value (2=best, 31=worst). Default 10 (high quality).
              Higher value → smaller file. Try 18-22 if file too large.
@@ -452,6 +457,46 @@ class VideoUploader:
 
     # ── Main upload via 0x1f WatchTheme protocol ─────────────────────────────
 
+    async def probe_capacity(self) -> int | None:
+        """
+        Probe device's actual available storage by sending a huge START and reading
+        the rejection code. The device embeds the current free bytes in the response.
+
+        Returns available bytes (e.g. 5_200_000) or None on failure.
+        """
+        await self.client.start_notify(self._notify_uuid, self._on_notify)
+
+        try:
+            while True:
+                await asyncio.wait_for(self._recv_raw(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+
+        if not await self.handshake():
+            return None
+
+        await asyncio.sleep(0.3)
+
+        # Send START with a declared size way beyond any real limit.
+        # Device will reject and embed the actual available bytes in the error code.
+        probe_size = 200_000_000
+        self.log(f"\n[probe] Sending START with declared_size={probe_size:,} (200 MB probe)...")
+        start_payload = build_wt_start_payload(b"", probe_size)
+        pkt = build_wt_packet(WT_CMD_START, start_payload)
+        await self._write(pkt)
+
+        kind, val = await self._wait_wt_response(timeout=15.0, context="probe")
+        if kind == "rejected_overage":
+            # val = how much probe_size exceeded the limit
+            # real limit = probe_size - val
+            return probe_size - val
+        if kind == "error" and val == 4:
+            self.log("  code=4 (charging mode). Remove from charger and retry.")
+            return None
+        # Unexpected — might still contain useful info
+        self.log(f"  Unexpected probe response: kind={kind!r} val={val}")
+        return None
+
     async def upload(self, video_path: Path) -> bool:
         avi_data  = video_path.read_bytes()
         avi_len   = len(avi_data)
@@ -540,17 +585,21 @@ class VideoUploader:
             return False
 
         kind, val = start_chunk
-        if kind == "rejected":
-            limit_mb = val / 1024 / 1024
-            blob_mb  = blob_len / 1024 / 1024
+        if kind == "rejected_overage":
+            # val = overage bytes (how much blob_len exceeds the device limit)
+            # real limit = blob_len - val
+            limit     = blob_len - val
+            limit_mb  = limit / 1024 / 1024
+            blob_mb   = blob_len / 1024 / 1024
+            overage_mb = val / 1024 / 1024
             self.log(f"\nERROR: Device rejected upload — blob too large.")
-            self.log(f"  Blob size:    {blob_mb:.1f} MB ({blob_len:,} bytes)")
-            self.log(f"  Device limit: ~{limit_mb:.1f} MB ({val:,} bytes) [inferred from response code]")
-            self.log(f"\nTo fix, re-encode with smaller output. Examples:")
-            self.log(f"  --duration 7        trim to 7 seconds")
-            self.log(f"  --quality 20        lower quality (higher number = smaller file)")
-            self.log(f"  --fps 15            15 fps instead of 24")
-            self.log(f"  --resolution 320x320  lower resolution")
+            self.log(f"  Blob size:    {blob_mb:.2f} MB ({blob_len:,} bytes)")
+            self.log(f"  Over limit:   {overage_mb:.3f} MB ({val:,} bytes)")
+            self.log(f"  Device limit: {limit_mb:.2f} MB ({limit:,} bytes)")
+            self.log(f"\nNeed to save {val:,} more bytes (~{overage_mb*100/blob_mb:.1f}%). Try:")
+            self.log(f"  --quality 31        (higher number = smaller MJPEG file)")
+            self.log(f"  --resolution 128x128")
+            self.log(f"  --duration <current minus a few seconds>")
             return False
         if kind == "error":
             self.log(f"ERROR: device returned error code {val}.")
@@ -651,11 +700,14 @@ class VideoUploader:
         """
         Wait for a 0x1f device response.
 
-        Response codes (from lt2 constructor, this.l=[1000,100M), this.m=[100M,200M)):
-          [1000, 100M)  → progress; normalized = code - 1000 = chunk-number ACK'd
-          2             → success/done
-          1             → check failed
-          others        → error or unexpected
+        Response codes (from lt2 constructor):
+          [1000, 100M)   → progress; normalized = code - 1000 = chunk-number ACK'd
+          [100M, 1000M)  → this.m range: str(code)[1]=type, int(str(code)[2:])=value
+                           e.g. 101740798 → type=0, value=1740798 (old device limit)
+                                297763584 → type=9, value=7763584 (clean device, 7.4MB free)
+          2              → success/done
+          1              → check failed
+          others         → error or unexpected
 
         Returns:
           ("progress", normalized)  — chunk ACK; normalized = chunk number ACK'd (1-based)
@@ -701,12 +753,12 @@ class VideoUploader:
                     m_value = int(s[2:])
                     if m_type == 0:
                         self.log(f"     Device returned fatal error (this.m type-0, "
-                                 f"errorCode=1010, value={m_value})")
-                        return ("rejected", m_value)
+                                 f"overage={m_value:,} bytes)")
+                        return ("rejected_overage", m_value)
                     else:
                         self.log(f"     Device rejected upload (this.m type-{m_type}, "
-                                 f"value={m_value:,}). Likely blob too large.")
-                        return ("rejected", m_value)
+                                 f"overage={m_value:,} bytes). Blob too large.")
+                        return ("rejected_overage", m_value)
                 self.log(f"     [WARN] unexpected WatchTheme code {code}")
                 return ("error", code)
 
@@ -752,7 +804,12 @@ async def main():
         epilog=__doc__,
     )
     parser.add_argument("device", help="Device name (BW01) or MAC address")
-    parser.add_argument("video",  help="Input video file (any format ffmpeg supports)")
+    parser.add_argument("video",  nargs="?", default=None,
+                        help="Input video file (any format ffmpeg supports). "
+                             "Optional when --probe is used.")
+    parser.add_argument("--probe", action="store_true",
+                        help="Just check available storage on device (no upload). "
+                             "Connects, sends a huge START, reads rejection → shows free bytes.")
     parser.add_argument("--fps",        type=int,   default=24,  help="FPS (default: 24)")
     parser.add_argument("--quality",    type=int,   default=10,  help="MJPEG quality 2-31 (default: 10, higher=smaller)")
     parser.add_argument("--duration",   type=float, default=None,help="Trim to N seconds")
@@ -767,7 +824,67 @@ async def main():
 
     args = parser.parse_args()
     name_or_addr = args.device
-    video_file   = Path(args.video)
+
+    # ── Probe mode: just check available space, no upload ─────────────────────
+    if args.probe:
+        device = await find_device(name_or_addr)
+        if device is None:
+            print(f"ERROR: device not found: {name_or_addr!r}")
+            sys.exit(1)
+        print(f"Found: {device.name!r}  ({device.address})")
+        async with BleakClient(device, timeout=30.0) as client:
+            mtu = getattr(client, "mtu_size", 512)
+            print(f"Connected. MTU={mtu}")
+            uploader = VideoUploader(client)
+            uploader._mtu_payload = max(20, mtu - 3)
+            avail = await uploader.probe_capacity()
+        if avail is None:
+            print("\nFailed to probe device capacity.")
+            sys.exit(1)
+        avail_mb = avail / 1024 / 1024
+        print(f"\n{'='*55}")
+        print(f"  Device available storage: {avail:,} bytes  ({avail_mb:.2f} MB)")
+        print(f"{'='*55}")
+        print()
+        print("Recommended upload parameters for IMG_4463.MP4 (~45s):")
+        print()
+        # Calculate what fits at different audio rates and durations
+        for audio_hz, audio_label in [(16000, "16kHz"), (8000, "8kHz")]:
+            bps = audio_hz * 2  # 16-bit mono
+            for duration in [45, 38, 30, 20]:
+                audio_bytes = bps * duration
+                video_budget = avail - audio_bytes - 4  # 4B blob header
+                if video_budget < 50_000:
+                    continue
+                fps = 20
+                total_frames = fps * duration
+                bytes_per_frame = video_budget // total_frames
+                # MJPEG quality vs bytes/frame heuristic (empirical, 160x160)
+                if bytes_per_frame >= 6000:
+                    res, q = "240x240", 20
+                elif bytes_per_frame >= 3500:
+                    res, q = "160x160", 20
+                elif bytes_per_frame >= 2000:
+                    res, q = "160x160", 28
+                else:
+                    res, q = "128x128", 31
+                total_est = audio_bytes + (bytes_per_frame * total_frames) + 4
+                fits = "OK" if total_est <= avail else "TIGHT"
+                print(f"  {duration:2d}s  audio={audio_label}  "
+                      f"{res} q={q} fps={fps}  "
+                      f"~{total_est/1024/1024:.1f}MB  [{fits}]")
+                print(f"       python upload_video.py {name_or_addr} IMG_4463.MP4 "
+                      f"--duration {duration} --audio-rate {audio_hz} "
+                      f"--resolution {res} --quality {q} --fps {fps}")
+                print()
+                break  # one suggestion per (audio, duration) combo
+        sys.exit(0)
+
+    # ── Normal upload mode ────────────────────────────────────────────────────
+    if args.video is None:
+        print("ERROR: video file required (or use --probe to check capacity)")
+        sys.exit(1)
+    video_file = Path(args.video)
 
     try:
         res_w, res_h = (int(x) for x in args.resolution.lower().split("x"))
@@ -816,13 +933,6 @@ async def main():
         sz = prepared.stat().st_size
         blob_sz = sz + 4
         print(f"      Done. {sz:,} bytes (blob: {blob_sz:,} bytes)")
-        DEVICE_LIMIT_BYTES = 1_740_798  # confirmed from device type-0 response code (101740798)
-        if blob_sz > DEVICE_LIMIT_BYTES:
-            over_pct = (blob_sz - DEVICE_LIMIT_BYTES) * 100 // DEVICE_LIMIT_BYTES
-            print(f"\n  WARNING: blob ({blob_sz/1024/1024:.1f} MB) exceeds estimated device limit "
-                  f"({DEVICE_LIMIT_BYTES/1024/1024:.1f} MB) by {over_pct}%.")
-            print(f"  The device will likely reject this upload.")
-            print(f"  Try: --quality 20, --fps 15, --duration 7, or --resolution 320x320")
 
     # ── Connect ───────────────────────────────────────────────────────────────
     device = await find_device(name_or_addr)
